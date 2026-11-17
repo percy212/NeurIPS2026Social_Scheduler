@@ -43,7 +43,8 @@ import queue
 import threading
 import time
 import uuid
-from collections import Counter
+from collections import Counter, deque
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from typing import Optional
 
@@ -227,6 +228,41 @@ class _Job:
     gpu_id: Optional[int] = None
     started_at: Optional[float] = None  # 현재 시도의 실행 시작 시각
     attempts: int = 0
+    # --- 통계용 누적 타이밍 ---
+    wait_total: float = 0.0             # 큐 대기 누적 (재시도 대기 / backoff 포함)
+    run_total: float = 0.0              # GPU 실행 누적 (모든 시도 합)
+    last_run_sec: Optional[float] = None  # 가장 최근 시도의 실행 시간 (성공 시 = 성공한 시도)
+    last_gpu: Optional[int] = None
+
+    def begin_run(self, gpu_id: int) -> None:
+        now = time.monotonic()
+        self.wait_total += now - self.waiting_since
+        self.state = "running"
+        self.gpu_id = self.last_gpu = gpu_id
+        self.started_at = now
+
+    def end_attempt(self) -> None:
+        now = time.monotonic()
+        if self.started_at is not None:
+            self.last_run_sec = now - self.started_at
+            self.run_total += self.last_run_sec
+        self.state = "waiting"          # 재시도하면 다시 대기 상태
+        self.gpu_id = None
+        self.started_at = None
+        self.waiting_since = now
+
+    def totals(self, now: float) -> tuple[float, float]:
+        """(대기 누적, 실행 누적). 진행 중인 구간도 now 까지 반영한다."""
+        wait, run = self.wait_total, self.run_total
+        if self.started_at is not None:
+            run += now - self.started_at
+        else:
+            wait += now - self.waiting_since
+        return wait, run
+
+
+def _iso(ts: float) -> str:
+    return datetime.fromtimestamp(ts, timezone.utc).isoformat(timespec="seconds")
 
 
 class GPUScheduler:
@@ -242,6 +278,8 @@ class GPUScheduler:
         infer_vram_mb: float = 40000,     # 추론에 필요한 free VRAM (모델 로드 후 기준)
         health_check_interval: float = 300.0,
         monitor: Optional[NvmlMonitor] = None,
+        history_size: int = 1000,         # 통계용으로 보관할 최근 완료 job 수
+        failure_history: int = 200,       # 보관할 최근 실패 job 수
     ):
         self._num_gpus = num_gpus
         self._max_queue = max_queue
@@ -260,6 +298,15 @@ class GPUScheduler:
         self._futures: dict[str, asyncio.Future] = {}
         self._waiting = 0
         self._jobs: dict[str, _Job] = {}     # 큐에 들어와 있거나 실행 중인 모든 요청
+        # --- 완료된 job 통계 (서버 재시작 시 초기화) ---
+        self._history: deque = deque(maxlen=history_size)       # 성공/실패/취소 전부
+        self._failures: deque = deque(maxlen=failure_history)   # 실패만 (history 보다 오래 보관)
+        self._total_succeeded = 0
+        self._total_failed = 0
+        self._total_cancelled = 0
+        self._rejected_queue_full = 0
+        self._failed_by_code: Counter = Counter()
+        self._since = time.time()
         self._stopping = False
 
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -324,16 +371,29 @@ class GPUScheduler:
     async def generate(self, request: GenerationRequest) -> GenerationResult:
         """성공 시 GenerationResult 반환, 실패 시 SchedulerError."""
         if self._waiting >= self._max_queue:
+            self._rejected_queue_full += 1
             raise SchedulerError(ErrorCode.QUEUE_FULL, "too many pending requests")
 
         now = time.monotonic()
         job = _Job(job_id=uuid.uuid4().hex[:12], choreography=request.choreography,
                    num_images=len(request.image_paths), submitted_at=now, waiting_since=now)
         self._jobs[job.job_id] = job
+        outcome = "success"
+        error: Optional[SchedulerError] = None
         try:
             return await self._generate_inner(request, job)
+        except SchedulerError as e:
+            outcome, error = "failed", e
+            raise
+        except asyncio.CancelledError:
+            outcome = "cancelled"          # 클라이언트가 끊음: 실패 통계에는 넣지 않는다
+            raise
+        except Exception as e:  # noqa: BLE001
+            outcome, error = "failed", SchedulerError(ErrorCode.UNKNOWN, repr(e), job.attempts)
+            raise
         finally:
             self._jobs.pop(job.job_id, None)   # 성공 / 실패 / 취소 어떤 경우에도 제거
+            self._record_finished(job, outcome, error)
 
     async def _generate_inner(self, request: GenerationRequest, job: _Job) -> GenerationResult:
         counts: Counter = Counter()
@@ -341,10 +401,6 @@ class GPUScheduler:
         attempts = 0
 
         while True:
-            job.state = "waiting"
-            job.gpu_id = None
-            job.started_at = None
-            job.waiting_since = time.monotonic()
             w = await self._acquire_gpu(exclude)
             epoch = w.epoch
             # 추론 직전 VRAM / GPU 상태 확인. 부적합하면 그 GPU 는 BUSY/DEAD 로 빠지고
@@ -353,10 +409,9 @@ class GPUScheduler:
                 continue
             attempts += 1
             job.attempts = attempts
-            job.state = "running"
-            job.gpu_id = w.gpu_id
-            job.started_at = time.monotonic()
+            job.begin_run(w.gpu_id)
             msg = await self._run_on_worker(w, epoch, request)
+            job.end_attempt()
 
             if msg["ok"]:
                 w.restarts = 0
@@ -437,6 +492,63 @@ class GPUScheduler:
                 }
                 for j in running
             ],
+        }
+
+    def _record_finished(self, job: _Job, outcome: str, error: Optional[SchedulerError]) -> None:
+        now = time.monotonic()
+        wait, run = job.totals(now)
+        rec = {
+            "job_id": job.job_id,
+            "outcome": outcome,                       # success | failed | cancelled
+            "finished_at": _iso(time.time()),
+            "choreography": job.choreography,
+            "num_images": job.num_images,
+            "attempts": job.attempts,
+            "gpu": job.last_gpu,                      # 마지막으로 실행된 GPU
+            "wait_sec": round(wait, 2),               # 큐 대기 누적
+            "generation_sec": (round(job.last_run_sec, 2)
+                               if outcome == "success" and job.last_run_sec is not None else None),
+            "run_total_sec": round(run, 2),           # 재시도 포함 GPU 실행 누적
+            "total_sec": round(now - job.submitted_at, 2),
+        }
+        if error is not None:
+            rec["error_code"] = int(error.code)
+            rec["error_name"] = error.code.name
+            rec["message"] = error.message[:200]
+        self._history.append(rec)
+        if outcome == "success":
+            self._total_succeeded += 1
+        elif outcome == "failed":
+            self._total_failed += 1
+            self._failed_by_code[rec.get("error_name", "UNKNOWN")] += 1
+            self._failures.append(rec)
+        else:
+            self._total_cancelled += 1
+
+    @staticmethod
+    def _summarize(values: list[float]) -> dict:
+        if not values:
+            return {"count": 0, "avg": None, "max": None}
+        return {"count": len(values), "avg": round(sum(values) / len(values), 2),
+                "max": round(max(values), 2)}
+
+    def stats(self, n: int = 50, failed_limit: int = 20) -> dict:
+        """최근 n 개 완료 job(성공+실패; 취소 제외)의 평균 대기/생성 시간 + 실패 job 목록."""
+        n = max(1, min(n, self._history.maxlen or n))
+        recent = [r for r in self._history if r["outcome"] in ("success", "failed")][-n:]
+        ok = [r for r in recent if r["outcome"] == "success"]
+        failures = list(self._failures)[-failed_limit:][::-1] if failed_limit > 0 else []
+        return {
+            "since": _iso(self._since),
+            "window": {"requested": n, "jobs": len(recent),
+                       "succeeded": len(ok), "failed": len(recent) - len(ok)},
+            "wait_sec": self._summarize([r["wait_sec"] for r in recent]),
+            "generation_sec": self._summarize([r["generation_sec"] for r in ok]),
+            "totals": {"succeeded": self._total_succeeded, "failed": self._total_failed,
+                       "cancelled": self._total_cancelled,
+                       "rejected_queue_full": self._rejected_queue_full},
+            "failed_by_code": dict(self._failed_by_code),
+            "recent_failures": failures,    # 최신순
         }
 
     # ------------------------- GPU acquire / release ------------------- #

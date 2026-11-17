@@ -12,10 +12,11 @@
 
 | 파일 | 역할 |
 |---|---|
-| `main.py` | FastAPI 서버. 업로드 수신, 입력 검증, 스케줄러 호출, 결과 mp4 반환 (`/generate`, `/health`, `/queue`) |
-| `scheduler.py` | `GPUScheduler`. GPU 별 worker 프로세스 관리, 작업 분배, 재시도, NVML 기반 health check |
+| `main.py` | FastAPI 서버. 업로드 수신, 입력 검증, 스케줄러 호출, 결과 mp4 반환 (`/generate`, `/health`, `/queue`, `/stats`) |
+| `scheduler.py` | `GPUScheduler`. GPU 별 worker 프로세스 관리, 작업 분배, 재시도, NVML 기반 health check, 요청 추적 / 통계 |
 | `generation.py` | 모델 계층. 에러 코드 / 요청·결과 타입 / 모델 옵션 선언 / `VideoGenerationModel` (현재 더미) |
 | `GENERATION_SPEC.md` | `generation.py` 를 새로 작성할 때 지켜야 할 규약 문서 |
+| `requirements.txt` | 실행에 필요한 Python 패키지 (`torch` 는 환경(CUDA 버전)에 맞게 별도 설치) |
 
 의존 방향: `main.py → scheduler.py → generation.py`, 그리고 `main.py → generation.py` (타입·옵션 검증용).
 
@@ -46,7 +47,7 @@ FastAPI(asyncio) ──generate()──> GPUScheduler ──task_q[gpu]──> w
 ## 3. 빠른 시작
 
 ```bash
-pip install fastapi uvicorn python-multipart nvidia-ml-py torch
+pip install -r requirements.txt
 
 # 반드시 --workers 1 : GPU 스케줄러가 이 프로세스 안에서 worker 들을 관리한다
 uvicorn main:app --host 0.0.0.0 --port 8000 --workers 1
@@ -172,6 +173,39 @@ curl -i -X POST http://localhost:8000/generate \
 - `attempts > 0` 인 대기 항목은 실패 후 재시도를 위해 다시 줄을 선 요청이다.
 - `timeout_in_sec` 은 실행 중인 요청이 `JOB_TIMEOUT` 에 걸리기까지 남은 시간이다.
 
+### `GET /stats`
+
+최근 완료된 job 들의 평균 큐 대기 시간 / 생성 시간과, 실패한 job 목록. 통계는 메모리에만 있으며 서버를 재시작하면 초기화된다.
+
+| 쿼리 | 타입 | 기본값 | 설명 |
+|---|---|---|---|
+| `n` | int | 50 | 통계에 사용할 최근 완료 job 수 (1 이상, `HISTORY_SIZE` 를 넘으면 `HISTORY_SIZE` 로 제한) |
+| `failed_limit` | int | 20 | 돌려줄 최근 실패 job 수 (0~1000, 0 이면 목록 생략) |
+
+```json
+{
+  "since": "2026-11-17T04:44:54+00:00",
+  "window": {"requested": 50, "jobs": 50, "succeeded": 47, "failed": 3},
+  "wait_sec": {"count": 50, "avg": 4.21, "max": 18.7},
+  "generation_sec": {"count": 47, "avg": 5.34, "max": 6.1},
+  "totals": {"succeeded": 412, "failed": 9, "cancelled": 2, "rejected_queue_full": 5},
+  "failed_by_code": {"FACE_NOT_DETECTED": 6, "TIMEOUT": 3},
+  "recent_failures": [
+    {"job_id": "73c0fdc18093", "outcome": "failed", "finished_at": "2026-11-17T05:01:12+00:00",
+     "choreography": "dance_a", "num_images": 2, "attempts": 2, "gpu": 1,
+     "wait_sec": 0.9, "generation_sec": null, "run_total_sec": 0.6, "total_sec": 1.5,
+     "error_code": 2003, "error_name": "MODEL_INFERENCE_FAILED", "message": "..."}
+  ]
+}
+```
+
+- **`window`**: 성공 + 실패 job 중 최근 `n` 개. 클라이언트가 연결을 끊어 취소된 job 은 평균과 실패 목록에서 제외한다.
+- **`wait_sec`**: 큐 대기 시간. 재시도로 다시 기다린 시간과 백오프도 포함한다. 윈도우의 성공 + 실패 job 전체가 대상이다.
+- **`generation_sec`**: 성공한 job 만 대상. 재시도가 있었더라도 *성공한 시도 1회*의 GPU 실행 시간이다. (재시도 포함 누적 실행 시간은 `recent_failures[].run_total_sec`)
+- **`totals`, `failed_by_code`**: 윈도우와 무관한 서버 시작(`since`) 이후 누적값. `rejected_queue_full` 은 큐가 가득 차 job 이 만들어지기 전에 거절된 요청 수다.
+- **`recent_failures`**: 최신순. 실패 전용 버퍼(`FAILURE_HISTORY`)에 보관되므로 일반 이력이 순환돼도 더 오래 남는다. `message` 는 200자까지만 담는다.
+- `main.py` 에서 스케줄러에 들어가기 전에 거절되는 입력 오류(이미지 개수, fps, 모델 옵션 값 오류, 업로드 용량 초과, 지원하지 않는 안무)는 집계되지 않는다.
+
 ---
 
 ## 5. 설정
@@ -188,6 +222,8 @@ curl -i -X POST http://localhost:8000/generate \
 | `HEALTH_CHECK_INTERVAL` | 300 | GPU health check 주기(초) |
 | `DISABLE_NVML` | 0 | `1` 이면 NVML 점검을 끄고 항상 정상으로 취급 (개발용) |
 | `WORK_ROOT` | 시스템 임시 디렉터리 | 업로드/결과 파일을 두는 작업 디렉터리 |
+| `HISTORY_SIZE` | 1000 | `/stats` 용으로 보관하는 최근 완료 job 수 (성공/실패/취소 전부) |
+| `FAILURE_HISTORY` | 200 | `/stats` 의 `recent_failures` 용으로 보관하는 최근 실패 job 수 |
 
 > `JOB_TIMEOUT=30`, `LOAD_VRAM_MB=INFER_VRAM_MB=5000` 은 **더미 모델 기준 값**이다. 실제 모델에서는 반드시 실측해서 바꿔야 한다 (산정 방법은 `GENERATION_SPEC.md` §7).
 
@@ -289,7 +325,7 @@ curl -i -X POST http://localhost:8000/generate \
 실행 중에 큐와 GPU 상태를 같이 보면 동작을 이해하기 쉽다.
 
 ```bash
-watch -n 1 'curl -s localhost:8000/queue; echo; curl -s localhost:8000/health'
+watch -n 1 'curl -s localhost:8000/queue; echo; curl -s localhost:8000/health; curl -s localhost:8000/stats'
 ```
 
 > `_simulate`, `_alloc_mb`, `_sleep_sec` 는 더미 전용 훅이다. 실제 모델에서는 **반드시 제거**해야 한다 (외부에서 프로세스 종료·대량 할당·sleep 을 유발할 수 있음).
@@ -311,7 +347,7 @@ watch -n 1 'curl -s localhost:8000/queue; echo; curl -s localhost:8000/health'
 ## 9. 운영 시 주의
 
 - **`--workers 1` 필수.** 스케줄러가 API 프로세스 안에서 worker 들을 관리한다. uvicorn worker 를 늘리면 GPU 마다 모델이 중복 로드되고 GPU 상태가 공유되지 않는다.
-- **인증이 없다.** `/generate`, `/health`, `/queue` 모두 열려 있으므로 외부에 노출한다면 앞단(리버스 프록시 등)에서 접근을 제어할 것.
+- **인증이 없다.** `/generate`, `/health`, `/queue`, `/stats` 모두 열려 있으므로 외부에 노출한다면 앞단(리버스 프록시 등)에서 접근을 제어할 것.
 - **큐는 메모리에만 있다.** 서버를 재시작하면 대기/실행 중이던 요청은 사라진다.
 - **디스크 사용량.** 업로드 파일과 결과 mp4 가 `WORK_ROOT` 에 요청 단위로 임시 저장된다. 요청 1건당 최대 (이미지 10 × 20MB + 오디오 50MB + 결과 mp4) 이다. `QUEUE_FULL` 판정은 업로드를 디스크에 저장한 *뒤* 스케줄러에서 이뤄지므로, 요청이 몰리면 `MAX_QUEUE` 로 계산한 것보다 더 많은 임시 파일이 잠시 쌓일 수 있다. 여유 공간을 넉넉히 잡을 것.
 - **`/health` 는 항상 200** 이다. 로드밸런서 health check 로 쓰려면 본문의 GPU 상태를 해석하는 래퍼가 필요하다.

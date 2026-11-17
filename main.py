@@ -29,7 +29,7 @@ import tempfile
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse
 from starlette.background import BackgroundTask
 from starlette.datastructures import UploadFile as StarletteUploadFile
@@ -50,6 +50,8 @@ INFER_VRAM_MB = float(os.environ.get("INFER_VRAM_MB", 5000))   # 추론에 필�
 HEALTH_CHECK_INTERVAL = float(os.environ.get("HEALTH_CHECK_INTERVAL", 300))
 ENABLE_NVML = os.environ.get("DISABLE_NVML", "0") != "1"   # GPU 없는 개발환경에서만 DISABLE_NVML=1
 WORK_ROOT = os.environ.get("WORK_ROOT", tempfile.gettempdir())
+HISTORY_SIZE = int(os.environ.get("HISTORY_SIZE", 1000))             # 통계용 최근 완료 job 보관 수
+FAILURE_HISTORY = int(os.environ.get("FAILURE_HISTORY", 200))        # 실패 job 보관 수
 
 MAX_IMAGES = 10
 MAX_IMAGE_BYTES = 20 * 1024 * 1024
@@ -68,6 +70,8 @@ scheduler = GPUScheduler(
     infer_vram_mb=INFER_VRAM_MB,
     health_check_interval=HEALTH_CHECK_INTERVAL,
     monitor=NvmlMonitor(enabled=ENABLE_NVML),
+    history_size=HISTORY_SIZE,
+    failure_history=FAILURE_HISTORY,
 )
 
 
@@ -263,4 +267,14 @@ async def health():
 
 @app.get("/queue")
 async def queue():
+    """현재 대기 중인 요청(FIFO 순서)과 GPU 에서 실행 중인 요청을 보여준다."""
     return scheduler.queue_snapshot()
+
+
+@app.get("/stats")
+async def stats(
+    n: int = Query(30, ge=1, description="통계에 사용할 최근 완료 job 수 (최대 HISTORY_SIZE)"),
+    failed_limit: int = Query(20, ge=0, le=1000, description="돌려줄 최근 실패 job 수"),
+):
+    """최근 n 개 job 의 평균 대기/생성 시간, 그리고 실패한 job 목록."""
+    return scheduler.stats(n=n, failed_limit=failed_limit)
